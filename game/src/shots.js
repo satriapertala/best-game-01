@@ -92,8 +92,5 @@ function staged(world, input, cfg, seed) {
   for (const [fx, fy, color, n] of cfg.burst)
     burstParticles(world.particles, fx * ARENA.w, fy * ARENA.h, color, n, world.rng, 240, 4, 0.55);
   world.time = 1.0;
-  // aim the virtual mouse where the player faces
-  input.mouse.x = p.x + Math.cos(cfg.aim) * 300;
-  input.mouse.y = p.y + Math.sin(cfg.aim) * 300;
   return true;
 }
