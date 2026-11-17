@@ -1,79 +1,99 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// shots.js — deterministic states for screenshot capture via ?shot=NAME.
+// Each mode rebuilds a representative frame with a fixed seed, so every
+// screenshot of the same name is identical.
+import { ARENA } from './config.js';
+import { makeEnemy, makeBullet, makePickup, burstParticles } from './entities.js';
+import { Rng } from './random.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+export function isShotMode(params) {
+  return params.has('shot');
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
+export function applyShot(world, input, params) {
+  const mode = params.get('shot') || '';
+  const seed = Number(params.get('seed') || '1');
+  world.rng = new Rng(seed);
+  if (mode === 'start') {
+    world.state = 'title';
+    world.time = 1.0;
+    return true;
   }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
+  if (mode === 'play') return staged(world, input, {
+    wave: 3, score: 12450, combo: 2.5, comboTimer: 1.4, kills: 37, hp: 71,
+    px: 0.5, py: 0.5, aim: -0.5, banner: '', dashCd: 0.4,
+    layout: [['chaser',0.22,0.30],['chaser',0.72,0.26],['speeder',0.44,0.14],['speeder',0.82,0.55],
+             ['shooter',0.16,0.70],['shooter',0.84,0.78],['splitter',0.56,0.84],['chaser',0.34,0.62],
+             ['child',0.62,0.44]],
+    shots: 7, pickups: [[0.30,0.22]], burst: [[0.72,0.26,'#ff5c7a',16],[0.44,0.14,'#ffd166',12]],
+  }, seed);
+  if (mode === 'wave5') return staged(world, input, {
+    wave: 5, score: 28310, combo: 4.25, comboTimer: 1.0, kills: 82, hp: 54,
+    px: 0.40, py: 0.50, aim: 0.9, banner: 'WAVE 5', dashCd: 0,
+    layout: [['chaser',0.14,0.20],['chaser',0.86,0.30],['speeder',0.60,0.18],['speeder',0.28,0.86],
+             ['shooter',0.76,0.72],['shooter',0.18,0.60],['splitter',0.50,0.10],['splitter',0.90,0.86],
+             ['child',0.46,0.40],['child',0.56,0.62]],
+    shots: 5, pickups: [[0.62,0.30]], burst: [[0.86,0.30,'#ff5c7a',18],[0.50,0.10,'#c77dff',14]],
+  }, seed);
+  if (mode === 'upgrade') {
+    world.state = 'upgrade';
+    world.wave = 4;
+    world.score = 20100;
+    world.kills = 61;
+    world.time = 1.0;
+    world.offerUpgrade();
+    // make the choices deterministic
+    world.upgradeChoices = ['rapid', 'pierce', 'shield'].map(id => world.rng ? null : null) && world.upgradeChoices;
+    return true;
   }
-  return best;
+  if (mode === 'end') {
+    world.state = 'gameover';
+    world.wave = 7;
+    world.score = 46200;
+    world.kills = 134;
+    world.time = 1.0;
+    world.player.alive = false;
+    world.aim = 0;
+    burstParticles(world.particles, ARENA.w / 2, ARENA.h / 2, '#4dffdb', 30, world.rng, 340, 5, 0.95);
+    return true;
+  }
+  return false;
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+// Build one staged play frame from a compact description.
+function staged(world, input, cfg, seed) {
+  world.state = 'playing';
+  world.wave = cfg.wave;
+  world.score = cfg.score;
+  world.combo = cfg.combo;
+  world.comboTimer = cfg.comboTimer;
+  world.kills = cfg.kills;
+  world.say(cfg.banner, cfg.banner ? 3 : 0);
+  const p = world.player;
+  p.x = ARENA.w * cfg.px; p.y = ARENA.h * cfg.py;
+  p.hp = cfg.hp;
+  p.aim = cfg.aim;
+  p.dashCooldown = cfg.dashCd;
+  for (const [type, fx, fy] of cfg.layout)
+    world.enemies.push(makeEnemy(type, fx * ARENA.w, fy * ARENA.h, cfg.wave, world.rng));
+  for (let i = 0; i < cfg.shots; i++) {
+    const a = cfg.aim + (i / cfg.shots) * Math.PI * 2 * 0.8;
+    const b = makeBullet(p.x + Math.cos(a) * 26, p.y + Math.sin(a) * 26, a, 820, 13, true);
+    b.life = 0.75;
+    world.bullets.push(b);
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+  // a couple of incoming enemy bullets near shooters
+  for (const [type, fx, fy] of cfg.layout) {
+    if (type !== 'shooter') continue;
+    const a = Math.atan2(p.y - fy * ARENA.h, p.x - fx * ARENA.w);
+    world.ebullets.push(makeBullet(fx * ARENA.w, fy * ARENA.h, a, 310, 12, false));
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  for (const [fx, fy] of cfg.pickups)
+    world.pickups.push(makePickup(fx * ARENA.w, fy * ARENA.h, 'heal', world.rng));
+  for (const [fx, fy, color, n] of cfg.burst)
+    burstParticles(world.particles, fx * ARENA.w, fy * ARENA.h, color, n, world.rng, 240, 4, 0.55);
+  world.time = 1.0;
+  // aim the virtual mouse where the player faces
+  input.mouse.x = p.x + Math.cos(cfg.aim) * 300;
+  input.mouse.y = p.y + Math.sin(cfg.aim) * 300;
+  return true;
 }

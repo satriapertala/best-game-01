@@ -1,134 +1,95 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
-
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+// main.js — NEON RIFT: fixed-timestep loop, screen flow, high-score persistence.
+// Flow: title -> click starts a run -> play (pause with P/ESC, upgrade picks on
+// even waves) -> game over -> click/R restarts, best score kept in localStorage.
+import { initRender, render, screenToArena } from './render.js';
+import { World } from './world.js';
+import { Input } from './input.js';
+import { initAudio, toggleMute, sfx } from './audio.js';
+import { isShotMode, applyShot } from './shots.js';
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+initRender(canvas);
+initAudio();
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+const HIGH_KEY = 'neon-rift-best';
+let highScore = Number(localStorage.getItem(HIGH_KEY) || 0);
+
+const world = new World();
+const input = new Input(canvas);
+let muted = false;
+
+// Deterministic screenshot states (?shot=start|play|wave5|upgrade|end).
+const params = new URLSearchParams(location.search);
+if (isShotMode(params)) applyShot(world, input, params);
+
+function announce(t) { status.textContent = t; }
+
+// Screens and edges are handled once per animation frame, before stepping.
+function handleFlow() {
+  const pauseEdge = input.takePause();
+  if (input.takeMute()) muted = toggleMute();
+
+  if (world.state === 'title') {
+    if (input.takeClick() || input.key('Space') || input.key('Enter')) {
+      world.reset();
+      world.start();
+      announce('Run started: survive the waves.');
+      input.keys.delete('Space');
+    }
+    return;
   }
-}
-
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
+  if (world.state === 'upgrade') {
+    for (const [code, i] of [['Digit1', 0], ['Digit2', 1], ['Digit3', 2]]) {
+      if (input.key(code)) { world.takeUpgrade(i); input.keys.delete(code); }
+    }
+    return;
   }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+  if (pauseEdge && (world.state === 'playing' || world.state === 'paused')) {
+    world.state = world.state === 'playing' ? 'paused' : 'playing';
+    announce(world.state === 'paused' ? 'Paused.' : 'Resumed.');
+    sfx.ui();
+    return;
   }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
+  if (world.state === 'gameover' && (input.takeClick() || input.key('KeyR') || input.key('Enter'))) {
+    if (world.score > highScore) {
+      highScore = world.score;
+      localStorage.setItem(HIGH_KEY, String(highScore));
+    }
     world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
+    world.start();
+    announce('Redeployed. Good luck.');
+    input.keys.delete('KeyR');
+  }
+}
+
+// Fixed 60 Hz simulation with an accumulator; rendering runs every rAF.
+const STEP = 1 / 60;
+let acc = 0;
+let last = performance.now();
+
+function frame(now) {
+  const elapsed = Math.min(0.25, (now - last) / 1000);
+  last = now;
+  acc += elapsed;
+
+  if (!isShotMode(params)) handleFlow();
+
+  // keep the aim in arena space
+  if (!isShotMode(params)) {
+    const a = screenToArena(input.mouse.x, input.mouse.y);
+    input.mouse.x = a.x; input.mouse.y = a.y;
+    world.player.aim = Math.atan2(input.mouse.y - world.player.y, input.mouse.x - world.player.x);
   }
 
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
+  while (acc >= STEP) {
+    world.update(STEP, input, world.state === 'playing' && input.firing());
+    acc -= STEP;
   }
+  // deterministic shots do not accumulate time past their staged frame
+  if (isShotMode(params)) acc = 0;
 
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
-  }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
+  render(world, highScore, muted);
   requestAnimationFrame(frame);
 }
-
-if (shot) runShot(shot);
-else runGame();
+requestAnimationFrame(frame);

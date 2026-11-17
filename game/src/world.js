@@ -1,124 +1,246 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// world.js — the state machine of a run: wave director, collisions, scoring,
+// combo, upgrades and the high score. Rendering and input stay outside.
+import { ARENA, WAVES, COMBO, PICKUP, UPGRADES } from './config.js';
+import { Rng } from './random.js';
+import {
+  makePlayer, makeEnemy, makeBullet, makePickup, burstParticles,
+  updatePlayer, playerFire, updateEnemy, splitEnemy, updateParticles, updatePickups, compact,
+} from './entities.js';
+import { sfx } from './audio.js';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+const TYPES = ['chaser', 'speeder', 'shooter', 'splitter'];
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
-}
-
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
-  }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
-
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+export class World {
+  constructor(seed) {
+    this.rng = new Rng(seed ?? (Date.now() & 0xffffffff));
+    this.reset();
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
+  reset() {
+    this.player = makePlayer(ARENA.w / 2, ARENA.h / 2);
+    this.enemies = [];
+    this.bullets = [];
+    this.ebullets = [];
+    this.particles = [];
+    this.pickups = [];
+    this.trail = [];
+    this.flashRing = [];
+    this.stars = [];
+    for (let i = 0; i < 90; i++)
+      this.stars.push({ x: this.rng.float(0, ARENA.w), y: this.rng.float(0, ARENA.h), s: this.rng.float(0.6, 2.2), tw: this.rng.float(0, Math.PI * 2) });
+    this.wave = 0;
+    this.score = 0;
+    this.combo = 1;
+    this.comboTimer = 0;
+    this.kills = 0;
+    this.state = 'title'; // title | playing | upgrade | gameover | paused
+    this.spawnQueue = 0;
+    this.spawnPool = ['chaser'];
+    this.spawnTimer = 0;
+    this.waveBreak = 0;
+    this.upgradeOffered = false;
+    this.upgradeChoices = [];
+    this.shake = 0;
+    this.flash = 0;
+    this.time = 0;
+    this.msg = '';
+    this.msgTimer = 0;
+    this.waveBanner = { text: '', t: 0 };
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  say(text, time = 2.2) { this.waveBanner = { text, t: time }; }
+
+  startWave() {
+    this.wave++;
+    const unlocked = 1 + Math.floor(this.wave / 2);
+    this.spawnPool = TYPES.slice(0, Math.min(TYPES.length, unlocked));
+    this.spawnQueue = WAVES.baseCount + (this.wave - 1) * WAVES.perWave;
+    this.spawnTimer = 0.5;
+    this.say(`WAVE ${this.wave}`);
+    sfx.wave();
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
+  start() {
+    this.state = 'playing';
+    this.wave = 0;
+    this.upgradeOffered = false;
+    this.waveBreak = 0;
+    this.startWave();
   }
 
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
+  offerUpgrade() {
+    const bag = UPGRADES.filter(u => !this.player.taken.has(u.id)).slice();
+    const picks = [];
+    while (picks.length < 3 && bag.length)
+      picks.push(bag.splice(Math.floor(this.rng.float(0, bag.length)), 1)[0]);
+    this.upgradeChoices = picks;
+    this.state = 'upgrade';
+    sfx.upgrade();
   }
 
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
+  takeUpgrade(i) {
+    const u = this.upgradeChoices[i];
+    if (!u) return;
+    this.player.taken.add(u.id);
+    u.apply(this.player);
+    this.state = 'playing';
+    this.say(`${u.name} INSTALLED`);
+    sfx.upgrade();
+  }
 
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
+  // --- per-frame --------------------------------------------------------
 
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
+  update(dt, input, fireHeld) {
+    this.time += dt;
+    this.shake = Math.max(0, this.shake - dt * 26);
+    this.flash = Math.max(0, this.flash - dt * 3);
+    if (this.waveBanner.t > 0) this.waveBanner.t -= dt;
+    for (const r of this.flashRing) r.t -= dt;
+    compact(this.flashRing);
+    for (const s of this.stars) s.tw += dt * 2;
 
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
+    if (this.state === 'playing') {
+      updatePlayer(this.player, dt, input, this);
+      if (fireHeld) playerFire(this.player, this);
+      this.stepWaves(dt);
+      this.stepEntities(dt);
+      this.collide();
+      if (this.comboTimer > 0) {
+        this.comboTimer -= dt;
+        if (this.comboTimer <= 0) this.combo = 1;
       }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
+    }
+    updateParticles(this.particles, dt);
+    updateParticles(this.trail, dt);
+  }
+
+  stepWaves(dt) {
+    if (this.state !== 'playing') return;
+    if (this.spawnQueue > 0) {
+      this.spawnTimer -= dt;
+      if (this.spawnTimer <= 0) {
+        this.spawnTimer = WAVES.spawnInterval;
+        const type = this.rng.pick(this.spawnPool);
+        // Spawn on an edge, but never within 260px of the player.
+        let x, y;
+        do {
+          const side = this.rng.int(0, 3);
+          if (side === 0) { x = this.rng.float(60, ARENA.w - 60); y = 45; }
+          else if (side === 1) { x = ARENA.w - 45; y = this.rng.float(60, ARENA.h - 60); }
+          else if (side === 2) { x = this.rng.float(60, ARENA.w - 60); y = ARENA.h - 45; }
+          else { x = 45; y = this.rng.float(60, ARENA.h - 60); }
+        } while (Math.hypot(x - this.player.x, y - this.player.y) < 260);
+        const e = makeEnemy(type, x, y, this.wave, this.rng);
+        this.enemies.push(e);
+        burstParticles(this.particles, x, y, e.color, 8, this.rng, 120, 3, 0.4);
+        this.spawnQueue--;
+      }
+      return;
+    }
+    if (this.enemies.length === 0) {
+      // Wave cleared. Every second wave an upgrade installs before the next.
+      if (this.wave % 2 === 0 && !this.upgradeOffered) {
+        this.upgradeOffered = true;
+        this.offerUpgrade();
+        return;
+      }
+      this.waveBreak -= dt;
+      if (this.waveBreak <= 0) {
+        this.upgradeOffered = false;
+        if (this.wave > 0) {
+          const bonus = 250 * this.wave;
+          this.score += bonus;
+          this.say(`WAVE ${this.wave} CLEARED  +${bonus}`);
         }
+        this.waveBreak = WAVES.breakTime;
+        this.startWave();
       }
     }
-    return events;
   }
 
-  reset();
-  return { state, reset, step };
+  stepEntities(dt) {
+    for (const e of this.enemies) updateEnemy(e, dt, this.player, this, this.rng);
+    compact(this.enemies);
+    for (const arr of [this.bullets, this.ebullets]) {
+      for (const b of arr) {
+        b.x += b.vx * dt; b.y += b.vy * dt; b.life -= dt;
+        if (b.life <= 0 || b.x < -30 || b.x > ARENA.w + 30 || b.y < -30 || b.y > ARENA.h + 30) b.alive = false;
+      }
+    }
+    compact(this.bullets); compact(this.ebullets);
+    updatePickups(this.pickups, dt, this.player, k => {
+      this.player.hp = Math.min(this.player.hpMax, this.player.hp + PICKUP.heal);
+      burstParticles(this.particles, k.x, k.y, '#7dff9e', 10, this.rng, 140, 3, 0.4);
+      sfx.pickup();
+    });
+  }
+
+  // --- combat -----------------------------------------------------------
+
+  hitEnemy(e, dmg, bx, by) {
+    e.hp -= dmg;
+    e.hitFlash = 1;
+    burstParticles(this.particles, bx ?? e.x, by ?? e.y, e.color, 6, this.rng, 160, 3, 0.35);
+    if (e.hp <= 0) {
+      e.alive = false;
+      this.kills++;
+      this.combo = Math.min(COMBO.maxMult, this.combo + COMBO.step);
+      this.comboTimer = COMBO.window;
+      this.score += Math.round(e.score * this.combo);
+      burstParticles(this.particles, e.x, e.y, e.color, 18, this.rng, 280, 4.5, 0.6);
+      this.shake = Math.max(this.shake, 6);
+      sfx.kill();
+      if (e.children > 0) {
+        this.enemies.push(...splitEnemy(e, this.wave, this.rng));
+        sfx.split();
+      }
+      if (this.rng.float(0, 1) < PICKUP.dropChance) this.pickups.push(makePickup(e.x, e.y, 'heal', this.rng));
+    } else {
+      sfx.hitEnemy();
+      this.comboTimer = Math.max(this.comboTimer, COMBO.window * 0.6);
+    }
+  }
+
+  hurtPlayer(dmg) {
+    const p = this.player;
+    if (p.invuln > 0 || p.dashTimer > 0) return;
+    p.hp -= dmg;
+    p.invuln = 0.9;
+    p.hitFlash = 1;
+    this.combo = 1;
+    this.shake = Math.max(this.shake, 9);
+    this.flash = 0.55;
+    burstParticles(this.particles, p.x, p.y, '#ff5c7a', 14, this.rng, 210, 3.5, 0.5);
+    sfx.hurt();
+    if (p.hp <= 0) {
+      p.hp = 0; p.alive = false;
+      this.state = 'gameover';
+      burstParticles(this.particles, p.x, p.y, '#4dffdb', 46, this.rng, 400, 5.5, 1.1);
+      this.shake = 16;
+      sfx.gameover();
+    }
+  }
+
+  collide() {
+    const p = this.player;
+    for (const b of this.bullets) {
+      for (const e of this.enemies) {
+        if (!e.alive || Math.hypot(b.x - e.x, b.y - e.y) >= e.r + b.r) continue;
+        this.hitEnemy(e, b.damage, b.x, b.y);
+        if (b.pierce > 0) b.pierce--;
+        else { b.alive = false; break; }
+      }
+    }
+    compact(this.bullets);
+    for (const b of this.ebullets) {
+      if (Math.hypot(b.x - p.x, b.y - p.y) < p.r + b.r) {
+        b.alive = false;
+        this.hurtPlayer(b.damage);
+      }
+    }
+    compact(this.ebullets);
+    if (p.alive) for (const e of this.enemies) {
+      if (Math.hypot(e.x - p.x, e.y - p.y) < p.r + e.r) this.hurtPlayer(e.damage);
+    }
+  }
 }
